@@ -2,15 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"os" // [เพิ่ม] ต้องใช้ os เพื่ออ่าน environment variable
+	"os"
+	"time"
 
 	firebase "firebase.google.com/go/v4"
 	"firebase.google.com/go/v4/messaging"
-	"github.com/joho/godotenv" // [เพิ่ม]
+	"github.com/joho/godotenv"
 	"google.golang.org/api/option"
 )
 
@@ -22,52 +24,98 @@ type RequestBody struct {
 
 var fcmClient *messaging.Client
 
-func main() {
-	// [เพิ่ม] 1. โหลดค่าจากไฟล์ .env (ถ้าหาไม่เจอให้แจ้งเตือน แต่ไม่ถึงกับพังถ้าเรา set environment ไว้ใน OS แล้ว)
-	err := godotenv.Load()
+// ------------------------------
+// Decode & Write Firebase Cred
+// ------------------------------
+func writeFirebaseCredentialFile() (string, error) {
+	base64Cred := os.Getenv("FIREBASE_CRED_BASE64")
+	credPath := os.Getenv("FIREBASE_CRED_FILE")
+	if credPath == "" {
+		credPath = "/tmp/service-account.json"
+	}
+
+	if base64Cred == "" {
+		return "", fmt.Errorf("FIREBASE_CRED_BASE64 is empty")
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(base64Cred)
 	if err != nil {
-		log.Println("Warning: Error loading .env file, checking OS environment variables")
+		return "", fmt.Errorf("base64 decode error: %v", err)
 	}
 
-	// [แก้ไข] 2. อ่านค่า Config จาก Environment Variable
-	credFile := os.Getenv("FIREBASE_CRED_FILE")
-	if credFile == "" {
-		credFile = "service-account.json" // Default fallback
+	err = os.WriteFile(credPath, decoded, 0600)
+	if err != nil {
+		return "", fmt.Errorf("write cred file error: %v", err)
 	}
 
-	opt := option.WithCredentialsFile(credFile)
+	return credPath, nil
+}
+
+func main() {
+	_ = godotenv.Load()
+
+	// ⭐ Force log to stdout (DigitalOcean reads only stdout)
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	log.Println("[INIT] Starting server...")
+
+	// ------------------------------
+	// STEP 1: Write Firebase credentials (AFTER container is ready)
+	// ------------------------------
+	credPath := "/tmp/service-account.json"
+	os.Setenv("FIREBASE_CRED_FILE", credPath)
+
+	// Async write (DO App Platform requires container be ready before writing)
+	go func() {
+		time.Sleep(1 * time.Second)
+		_, err := writeFirebaseCredentialFile()
+		if err != nil {
+			log.Fatalf("[CRED ERROR] %v\n", err)
+		}
+		log.Println("[CRED] Firebase credential file written successfully")
+	}()
+
+	// Wait for credential file
+	time.Sleep(2 * time.Second)
+
+	// ------------------------------
+	// STEP 2: Init Firebase
+	// ------------------------------
+	opt := option.WithCredentialsFile(credPath)
 	app, err := firebase.NewApp(context.Background(), nil, opt)
 	if err != nil {
-		log.Fatalf("error initializing app: %v\n", err)
+		log.Fatalf("[FIREBASE ERROR] %v\n", err)
 	}
 
 	fcmClient, err = app.Messaging(context.Background())
 	if err != nil {
-		log.Fatalf("error getting Messaging client: %v\n", err)
+		log.Fatalf("[FCM ERROR] %v\n", err)
 	}
 
+	log.Println("[OK] Firebase initialized")
+
+	// ------------------------------
+	// STEP 3: Setup HTTP server
+	// ------------------------------
 	http.HandleFunc("/send", handleNotification)
 
-	// [แก้ไข] 3. อ่าน Port
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	fmt.Println("Server POC Version 1.3") // [เพิ่ม] แสดงเวอร์ชันของเซิร์ฟเวอร์
-	fmt.Printf("Server starting on port %s...\n", port)
+	log.Printf("[READY] Server POC Version 1.3 on port %s\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
 func handleNotification(w http.ResponseWriter, r *http.Request) {
-	// [แก้ไข] 4. อ่าน API Key จาก Env
 	apiKey := os.Getenv("SERVER_API_KEY")
-
 	requestKey := r.Header.Get("X-API-Key")
-	// เช็คว่ามีการตั้งค่า key ไหม และ key ตรงกันไหม
+
 	if apiKey != "" && requestKey != apiKey {
-		log.Printf("[REJECTED] Invalid API Key attempt: %s\n", requestKey)
-		http.Error(w, "Unauthorized: Invalid API Key", http.StatusUnauthorized)
+		log.Printf("[REJECTED] Invalid API Key: %s\n", requestKey)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -82,7 +130,8 @@ func handleNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[INCOMING] Availability: %.2f | Cart: %d | Color: %s\n", req.Availability, req.CartCount, req.StatusColor)
+	log.Printf("[INCOMING] Availability: %.2f | Cart: %d | Color: %s\n",
+		req.Availability, req.CartCount, req.StatusColor)
 
 	dataPayload := map[string]string{
 		"availability": fmt.Sprintf("%.2f%%", req.Availability),
@@ -90,24 +139,23 @@ func handleNotification(w http.ResponseWriter, r *http.Request) {
 		"statusColor":  req.StatusColor,
 	}
 
-	// [แก้ไข] 5. อ่าน Topic จาก Env
 	topic := os.Getenv("FCM_TOPIC")
 	if topic == "" {
-		topic = "all_users" // Default fallback
+		topic = "all_users"
 	}
 
-	message := &messaging.Message{
+	msg := &messaging.Message{
 		Data:  dataPayload,
 		Topic: topic,
 	}
 
-	response, err := fcmClient.Send(context.Background(), message)
+	resp, err := fcmClient.Send(context.Background(), msg)
 	if err != nil {
-		log.Println("Error sending message:", err)
+		log.Println("[ERROR] Sending FCM:", err)
 		http.Error(w, "Failed to send notification", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[SUCCESS] Sent to Firebase. Message ID: %s\n", response)
-	fmt.Fprintf(w, "Successfully sent message: %s", response)
+	log.Printf("[SUCCESS] FCM Message ID: %s\n", resp)
+	fmt.Fprintf(w, "Sent: %s", resp)
 }
