@@ -8,7 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"time"
+	"strings" // สำหรับ replacing \n ถ้าจำเป็น
 
 	firebase "firebase.google.com/go/v4"
 	"firebase.google.com/go/v4/messaging"
@@ -16,87 +16,54 @@ import (
 	"google.golang.org/api/option"
 )
 
+// [NEW] Struct สำหรับรับ Payload แบบง่าย: {"displayText": "HELLO WORLD"}
 type RequestBody struct {
-	Availability float64 `json:"availability"`
-	CartCount    int     `json:"cartcount"`
-	StatusColor  string  `json:"statusColor"`
+	DisplayText string `json:"displayText"`
 }
 
 var fcmClient *messaging.Client
 
-// ------------------------------
-// Decode & Write Firebase Cred
-// ------------------------------
-func writeFirebaseCredentialFile() (string, error) {
-	base64Cred := os.Getenv("FIREBASE_CRED_BASE64")
-	credPath := os.Getenv("FIREBASE_CRED_FILE")
-	if credPath == "" {
-		credPath = "/tmp/service-account.json"
-	}
-
-	if base64Cred == "" {
-		return "", fmt.Errorf("FIREBASE_CRED_BASE64 is empty")
-	}
-
-	decoded, err := base64.StdEncoding.DecodeString(base64Cred)
-	if err != nil {
-		return "", fmt.Errorf("base64 decode error: %v", err)
-	}
-
-	err = os.WriteFile(credPath, decoded, 0600)
-	if err != nil {
-		return "", fmt.Errorf("write cred file error: %v", err)
-	}
-
-	return credPath, nil
-}
-
+// ----------------------------------------------------
+// STEP 1: Main Function (Load Config and Init Firebase)
+// ----------------------------------------------------
 func main() {
-	_ = godotenv.Load()
-
-	// ⭐ Force log to stdout (DigitalOcean reads only stdout)
+	_ = godotenv.Load() // Load local .env file
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	log.Println("[INIT] Starting server...")
 
-	// ------------------------------
-	// STEP 1: Write Firebase credentials (AFTER container is ready)
-	// ------------------------------
-	credPath := "/tmp/service-account.json"
-	os.Setenv("FIREBASE_CRED_FILE", credPath)
+	// 1. Get Base64 String from Environment
+	credBase64 := os.Getenv("FIREBASE_CRED_BASE64")
+	if credBase64 == "" {
+		log.Fatalf("[CRED ERROR] FIREBASE_CRED_BASE64 environment variable is empty. Cannot initialize Firebase.")
+	}
 
-	// Async write (DO App Platform requires container be ready before writing)
-	go func() {
-		time.Sleep(1 * time.Second)
-		_, err := writeFirebaseCredentialFile()
-		if err != nil {
-			log.Fatalf("[CRED ERROR] %v\n", err)
-		}
-		log.Println("[CRED] Firebase credential file written successfully")
-	}()
+	// 2. Decode Base64 (Handling potential newlines if input came from a CLI pipe)
+	// **Note: This replaces the file writing logic**
+	credBase64 = strings.ReplaceAll(credBase64, "\n", "") // Clean up newlines for robustness
+	
+	decodedCreds, err := base64.StdEncoding.DecodeString(credBase64)
+	if err != nil {
+		log.Fatalf("[CRED ERROR] Base64 decode error: %v", err)
+	}
 
-	// Wait for credential file
-	time.Sleep(2 * time.Second)
-
-	// ------------------------------
-	// STEP 2: Init Firebase
-	// ------------------------------
-	opt := option.WithCredentialsFile(credPath)
+	// 3. Init Firebase directly from JSON bytes
+	opt := option.WithCredentialsJSON(decodedCreds)
 	app, err := firebase.NewApp(context.Background(), nil, opt)
 	if err != nil {
-		log.Fatalf("[FIREBASE ERROR] %v\n", err)
+		log.Fatalf("[FIREBASE ERROR] Failed to initialize app: %v\n", err)
 	}
 
 	fcmClient, err = app.Messaging(context.Background())
 	if err != nil {
-		log.Fatalf("[FCM ERROR] %v\n", err)
+		log.Fatalf("[FCM ERROR] Failed to get Messaging client: %v\n", err)
 	}
 
-	log.Println("[OK] Firebase initialized")
+	log.Println("[OK] Firebase initialized successfully from secure environment variable.")
 
 	// ------------------------------
-	// STEP 3: Setup HTTP server
+	// STEP 2: Setup HTTP server
 	// ------------------------------
 	http.HandleFunc("/send", handleNotification)
 
@@ -105,11 +72,15 @@ func main() {
 		port = "8080"
 	}
 
-	log.Printf("[READY] Server POC Version 1.3 on port %s\n", port)
+	log.Printf("[READY] Server POC Version 1.5 on port %s\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
+// ----------------------------------------------------
+// STEP 3: Handle Notification Request
+// ----------------------------------------------------
 func handleNotification(w http.ResponseWriter, r *http.Request) {
+	// 1. API Key Check
 	apiKey := os.Getenv("SERVER_API_KEY")
 	requestKey := r.Header.Get("X-API-Key")
 
@@ -124,19 +95,19 @@ func handleNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req RequestBody
+	// 2. Decode JSON (Simplified Payload)
+	var req RequestBody // ใช้ struct ใหม่
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("[INCOMING] Availability: %.2f | Cart: %d | Color: %s\n",
-		req.Availability, req.CartCount, req.StatusColor)
+	// 3. Log Payload
+	log.Printf("[INCOMING] DisplayText: %s\n", req.DisplayText)
 
+	// 4. Create Data Payload
 	dataPayload := map[string]string{
-		"availability": fmt.Sprintf("%.2f%%", req.Availability),
-		"cartcount":    fmt.Sprintf("%d", req.CartCount),
-		"statusColor":  req.StatusColor,
+		"displayText": req.DisplayText, // ใช้ DisplayText
 	}
 
 	topic := os.Getenv("FCM_TOPIC")
@@ -149,6 +120,7 @@ func handleNotification(w http.ResponseWriter, r *http.Request) {
 		Topic: topic,
 	}
 
+	// 5. Send FCM
 	resp, err := fcmClient.Send(context.Background(), msg)
 	if err != nil {
 		log.Println("[ERROR] Sending FCM:", err)
