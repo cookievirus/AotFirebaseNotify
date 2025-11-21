@@ -1,0 +1,48 @@
+# =========================
+# 🔐 Secrets & Environment (สำคัญที่สุด)
+# =========================
+.env
+service-account.json
+google-services.json
+*.keystore
+*.jks
+local.properties
+
+# =========================
+# 🐹 Golang
+# =========================
+# Binaries (ไฟล์ที่ได้จากการ Build)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+main
+test
+
+# Test output
+*.out
+*.test
+
+# Dependency directories (ถ้าไม่ได้ใช้ vendor mode)
+vendor/
+
+# =========================
+# 🤖 Android & Gradle
+# =========================
+.gradle/
+build/
+app/build/
+!gradle-wrapper.jar
+
+# Android Studio generated files
+.idea/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+.navigation/
+
+# Log files
+*.log
